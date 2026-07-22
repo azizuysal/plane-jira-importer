@@ -122,12 +122,16 @@ export interface JiraComment {
 
 // ─── API Responses ───────────────────────────────────────────────────────────
 
-/** Paginated response from Jira's search endpoint. */
+/**
+ * Response from `/rest/api/3/search/jql`.
+ *
+ * This endpoint uses token-based pagination — it ignores `startAt` and does
+ * not return `total`. Follow `nextPageToken` until `isLast` is true.
+ */
 export interface JiraSearchResponse {
   issues: JiraIssue[];
-  total?: number;
-  startAt?: number;
-  maxResults?: number;
+  nextPageToken?: string;
+  isLast?: boolean;
 }
 
 /** Paginated response from the issue comments endpoint. */
