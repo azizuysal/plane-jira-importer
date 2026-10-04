@@ -7,6 +7,7 @@
 
 import { log } from './logger.js';
 import { sleep } from './helpers.js';
+import { HttpError } from './http.js';
 
 /** Options controlling retry behavior. */
 export interface RetryOptions {
@@ -20,26 +21,6 @@ export interface RetryOptions {
   context?: string;
 }
 
-/** Subset of an HTTP error shape used for retry decisions. */
-interface RetryableError {
-  response?: {
-    status: number;
-    headers?: Record<string, string | string[] | undefined>;
-  };
-}
-
-function hasHttpResponse(
-  err: unknown,
-): err is RetryableError & { response: NonNullable<RetryableError['response']> } {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    'response' in err &&
-    typeof (err as RetryableError).response === 'object' &&
-    (err as RetryableError).response !== null
-  );
-}
-
 /**
  * Whether an error is retryable.
  *
@@ -47,8 +28,8 @@ function hasHttpResponse(
  * (errors without an HTTP response).
  */
 export function isRetryable(err: unknown): boolean {
-  if (hasHttpResponse(err)) {
-    const { status } = err.response;
+  if (err instanceof HttpError) {
+    const { status } = err;
     return status === 429 || status >= 500;
   }
   // Network errors (no response) — ECONNREFUSED, ETIMEDOUT, etc.
@@ -62,13 +43,8 @@ export function isRetryable(err: unknown): boolean {
  * missing or unparseable.
  */
 export function getRetryAfterMs(err: unknown): number | null {
-  if (!hasHttpResponse(err)) return null;
-
-  const headers = err.response.headers;
-  if (!headers) return null;
-
-  const raw = headers['retry-after'];
-  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!(err instanceof HttpError)) return null;
+  const value = err.headers.get('Retry-After');
   if (!value) return null;
 
   const seconds = Number.parseInt(value, 10);
@@ -95,12 +71,7 @@ export function calculateDelay(attempt: number, baseDelayMs: number, maxDelayMs:
  * - Logs each retry attempt at warn level
  */
 export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
-  const {
-    maxRetries = 3,
-    baseDelayMs = 1000,
-    maxDelayMs = 30_000,
-    context = 'API call',
-  } = options;
+  const { maxRetries = 3, baseDelayMs = 1000, maxDelayMs = 30_000, context = 'API call' } = options;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -115,7 +86,7 @@ export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions =
       const retryAfterMs = getRetryAfterMs(err);
       const delay = retryAfterMs ?? calculateDelay(attempt, baseDelayMs, maxDelayMs);
 
-      const statusInfo = hasHttpResponse(err) ? ` (HTTP ${err.response.status})` : '';
+      const statusInfo = err instanceof HttpError ? ` (HTTP ${err.status})` : '';
 
       log.warn(
         `Retry ${attempt + 1}/${maxRetries} for ${context}${statusInfo} — waiting ${Math.round(delay / 1000)}s`,

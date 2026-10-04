@@ -18,6 +18,7 @@ vi.mock('../src/utils/helpers.js', () => ({
   sleep: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { HttpError } from '../src/utils/http.js';
 import { log } from '../src/utils/logger.js';
 import { sleep } from '../src/utils/helpers.js';
 import { withRetry, isRetryable, getRetryAfterMs, calculateDelay } from '../src/utils/retry.js';
@@ -29,31 +30,31 @@ const mockSleep = vi.mocked(sleep);
 
 describe('isRetryable', () => {
   it('returns true for HTTP 429', () => {
-    expect(isRetryable({ response: { status: 429 } })).toBe(true);
+    expect(isRetryable(new HttpError(429, new Headers(), ''))).toBe(true);
   });
 
   it('returns true for HTTP 500', () => {
-    expect(isRetryable({ response: { status: 500 } })).toBe(true);
+    expect(isRetryable(new HttpError(500, new Headers(), ''))).toBe(true);
   });
 
   it('returns true for HTTP 502', () => {
-    expect(isRetryable({ response: { status: 502 } })).toBe(true);
+    expect(isRetryable(new HttpError(502, new Headers(), ''))).toBe(true);
   });
 
   it('returns true for HTTP 503', () => {
-    expect(isRetryable({ response: { status: 503 } })).toBe(true);
+    expect(isRetryable(new HttpError(503, new Headers(), ''))).toBe(true);
   });
 
   it('returns false for HTTP 400', () => {
-    expect(isRetryable({ response: { status: 400 } })).toBe(false);
+    expect(isRetryable(new HttpError(400, new Headers(), ''))).toBe(false);
   });
 
   it('returns false for HTTP 401', () => {
-    expect(isRetryable({ response: { status: 401 } })).toBe(false);
+    expect(isRetryable(new HttpError(401, new Headers(), ''))).toBe(false);
   });
 
   it('returns false for HTTP 404', () => {
-    expect(isRetryable({ response: { status: 404 } })).toBe(false);
+    expect(isRetryable(new HttpError(404, new Headers(), ''))).toBe(false);
   });
 
   it('returns true for network errors (Error without response)', () => {
@@ -71,22 +72,22 @@ describe('isRetryable', () => {
 
 describe('getRetryAfterMs', () => {
   it('extracts Retry-After header in seconds → milliseconds', () => {
-    const err = { response: { status: 429, headers: { 'retry-after': '5' } } };
+    const err = new HttpError(429, new Headers({ 'retry-after': '5' }), '');
     expect(getRetryAfterMs(err)).toBe(5000);
   });
 
   it('returns null when no Retry-After header', () => {
-    const err = { response: { status: 429, headers: {} } };
+    const err = new HttpError(429, new Headers({}), '');
     expect(getRetryAfterMs(err)).toBeNull();
   });
 
-  it('returns null when headers are undefined', () => {
-    const err = { response: { status: 429 } };
+  it('returns null for an empty response header set', () => {
+    const err = new HttpError(429, new Headers(), '');
     expect(getRetryAfterMs(err)).toBeNull();
   });
 
   it('returns null for non-numeric Retry-After', () => {
-    const err = { response: { status: 429, headers: { 'retry-after': 'not-a-number' } } };
+    const err = new HttpError(429, new Headers({ 'retry-after': 'not-a-number' }), '');
     expect(getRetryAfterMs(err)).toBeNull();
   });
 
@@ -94,8 +95,8 @@ describe('getRetryAfterMs', () => {
     expect(getRetryAfterMs(new Error('network'))).toBeNull();
   });
 
-  it('handles array header values', () => {
-    const err = { response: { status: 429, headers: { 'retry-after': ['10'] } } };
+  it('handles mixed-case header names', () => {
+    const err = new HttpError(429, new Headers({ 'Retry-After': '10' }), '');
     expect(getRetryAfterMs(err)).toBe(10000);
   });
 });
@@ -145,7 +146,7 @@ describe('withRetry', () => {
   it('retries on retryable error and succeeds', async () => {
     const fn = vi
       .fn()
-      .mockRejectedValueOnce({ response: { status: 503 } })
+      .mockRejectedValueOnce(new HttpError(503, new Headers(), ''))
       .mockResolvedValue('recovered');
 
     const result = await withRetry(fn, { maxRetries: 3, baseDelayMs: 100 });
@@ -156,7 +157,7 @@ describe('withRetry', () => {
   });
 
   it('throws immediately on non-retryable error', async () => {
-    const err = { response: { status: 404 } };
+    const err = new HttpError(404, new Headers(), '');
     const fn = vi.fn().mockRejectedValue(err);
 
     await expect(withRetry(fn, { maxRetries: 3 })).rejects.toBe(err);
@@ -165,7 +166,7 @@ describe('withRetry', () => {
   });
 
   it('throws after exhausting all retries', async () => {
-    const err = { response: { status: 500 } };
+    const err = new HttpError(500, new Headers(), '');
     const fn = vi.fn().mockRejectedValue(err);
 
     await expect(withRetry(fn, { maxRetries: 2 })).rejects.toBe(err);
@@ -174,9 +175,7 @@ describe('withRetry', () => {
   });
 
   it('uses Retry-After header when available', async () => {
-    const err = {
-      response: { status: 429, headers: { 'retry-after': '3' } },
-    };
+    const err = new HttpError(429, new Headers({ 'retry-after': '3' }), '');
     const fn = vi.fn().mockRejectedValueOnce(err).mockResolvedValue('ok');
 
     await withRetry(fn, { maxRetries: 3 });
@@ -187,7 +186,7 @@ describe('withRetry', () => {
   it('logs retry attempts with context', async () => {
     const fn = vi
       .fn()
-      .mockRejectedValueOnce({ response: { status: 502 } })
+      .mockRejectedValueOnce(new HttpError(502, new Headers(), ''))
       .mockResolvedValue('ok');
 
     await withRetry(fn, { maxRetries: 3, context: 'fetching data' });
@@ -198,10 +197,7 @@ describe('withRetry', () => {
   });
 
   it('retries network errors (no response)', async () => {
-    const fn = vi
-      .fn()
-      .mockRejectedValueOnce(new Error('ECONNREFUSED'))
-      .mockResolvedValue('ok');
+    const fn = vi.fn().mockRejectedValueOnce(new Error('ECONNREFUSED')).mockResolvedValue('ok');
 
     const result = await withRetry(fn, { maxRetries: 3, baseDelayMs: 100 });
 
@@ -210,7 +206,7 @@ describe('withRetry', () => {
   });
 
   it('defaults maxRetries to 3', async () => {
-    const err = { response: { status: 500 } };
+    const err = new HttpError(500, new Headers(), '');
     const fn = vi.fn().mockRejectedValue(err);
 
     await expect(withRetry(fn)).rejects.toBe(err);

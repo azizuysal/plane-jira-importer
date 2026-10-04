@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
@@ -21,26 +21,14 @@ vi.mock('../src/utils/helpers.js', () => ({
 
 // retry utility uses sleep + log internally (both already mocked above)
 
-const mockGet = vi.fn();
-const mockPost = vi.fn();
-const mockPatch = vi.fn();
-const mockDelete = vi.fn();
+const mockFetch = vi.fn<typeof fetch>();
 
-vi.mock('axios', () => ({
-  default: {
-    create: vi.fn(() => ({
-      get: mockGet,
-      post: mockPost,
-      patch: mockPatch,
-      delete: mockDelete,
-    })),
-    isAxiosError: vi.fn(
-      (err: unknown) =>
-        typeof err === 'object' && err !== null && 'isAxiosError' in err,
-    ),
-    post: vi.fn(),
-  },
-}));
+function response(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 
 import { PlaneClient } from '../src/clients/plane.js';
 
@@ -50,10 +38,8 @@ describe('PlaneClient', () => {
   let client: PlaneClient;
 
   beforeEach(() => {
-    mockGet.mockReset();
-    mockPost.mockReset();
-    mockPatch.mockReset();
-    mockDelete.mockReset();
+    mockFetch.mockReset();
+    vi.stubGlobal('fetch', mockFetch);
 
     client = new PlaneClient({
       host: 'https://plane.test.com',
@@ -64,12 +50,14 @@ describe('PlaneClient', () => {
     });
   });
 
+  afterEach(() => vi.unstubAllGlobals());
+
   // ── listProjects ─────────────────────────────────────────────────────
 
   describe('listProjects', () => {
     it('handles a flat array response', async () => {
       const projects = [{ id: '1', identifier: 'PROJ', name: 'Project' }];
-      mockGet.mockResolvedValueOnce({ data: projects });
+      mockFetch.mockResolvedValueOnce(response(projects));
 
       const result = await client.listProjects();
 
@@ -77,19 +65,19 @@ describe('PlaneClient', () => {
     });
 
     it('handles paginated responses', async () => {
-      mockGet
-        .mockResolvedValueOnce({
-          data: {
+      mockFetch
+        .mockResolvedValueOnce(
+          response({
             results: [{ id: '1', identifier: 'P1', name: 'P1' }],
             next_cursor: 'cursor-abc',
             next_page_results: true,
-          },
-        })
-        .mockResolvedValueOnce({
-          data: {
+          }),
+        )
+        .mockResolvedValueOnce(
+          response({
             results: [{ id: '2', identifier: 'P2', name: 'P2' }],
-          },
-        });
+          }),
+        );
 
       const result = await client.listProjects();
 
@@ -104,7 +92,7 @@ describe('PlaneClient', () => {
   describe('listStates', () => {
     it('returns states for a project', async () => {
       const states = [{ id: 's1', name: 'Todo', group: 'unstarted' }];
-      mockGet.mockResolvedValueOnce({ data: states });
+      mockFetch.mockResolvedValueOnce(response(states));
 
       const result = await client.listStates('proj-1');
 
@@ -117,7 +105,7 @@ describe('PlaneClient', () => {
   describe('listLabels', () => {
     it('returns labels for a project', async () => {
       const labels = [{ id: 'l1', name: 'Bug', color: '#ff0000' }];
-      mockGet.mockResolvedValueOnce({ data: labels });
+      mockFetch.mockResolvedValueOnce(response(labels));
 
       const result = await client.listLabels('proj-1');
 
@@ -130,7 +118,7 @@ describe('PlaneClient', () => {
   describe('createLabel', () => {
     it('creates a new label', async () => {
       const label = { id: 'l1', name: 'Jira: Bug' };
-      mockPost.mockResolvedValueOnce({ data: label });
+      mockFetch.mockResolvedValueOnce(response(label));
 
       const result = await client.createLabel('proj-1', 'Jira: Bug');
 
@@ -138,17 +126,14 @@ describe('PlaneClient', () => {
     });
 
     it('returns existing label on 409 conflict', async () => {
-      mockPost.mockRejectedValueOnce({
-        isAxiosError: true,
-        response: { status: 409 },
-      });
+      mockFetch.mockResolvedValueOnce(response({}, 409));
 
       // listLabels call triggered by the 409 handler
       const existing = [
         { id: 'l1', name: 'Jira: Bug' },
         { id: 'l2', name: 'Jira: Story' },
       ];
-      mockGet.mockResolvedValueOnce({ data: existing });
+      mockFetch.mockResolvedValueOnce(response(existing));
 
       const result = await client.createLabel('proj-1', 'Jira: Bug');
 
@@ -160,10 +145,8 @@ describe('PlaneClient', () => {
 
   describe('listMembers', () => {
     it('returns workspace members', async () => {
-      const members = [
-        { id: 'm1', email: 'alice@example.com', display_name: 'Alice', role: 20 },
-      ];
-      mockGet.mockResolvedValueOnce({ data: members });
+      const members = [{ id: 'm1', email: 'alice@example.com', display_name: 'Alice', role: 20 }];
+      mockFetch.mockResolvedValueOnce(response(members));
 
       const result = await client.listMembers();
 
@@ -176,7 +159,7 @@ describe('PlaneClient', () => {
   describe('listWorkItems', () => {
     it('handles a flat array response', async () => {
       const items = [{ id: 'wi1', name: 'Item 1' }];
-      mockGet.mockResolvedValueOnce({ data: items });
+      mockFetch.mockResolvedValueOnce(response(items));
 
       const result = await client.listWorkItems('proj-1');
 
@@ -184,19 +167,19 @@ describe('PlaneClient', () => {
     });
 
     it('handles paginated work items', async () => {
-      mockGet
-        .mockResolvedValueOnce({
-          data: {
+      mockFetch
+        .mockResolvedValueOnce(
+          response({
             results: [{ id: 'wi1', name: 'First' }],
             next_cursor: 'c1',
             next_page_results: true,
-          },
-        })
-        .mockResolvedValueOnce({
-          data: {
+          }),
+        )
+        .mockResolvedValueOnce(
+          response({
             results: [{ id: 'wi2', name: 'Second' }],
-          },
-        });
+          }),
+        );
 
       const result = await client.listWorkItems('proj-1');
 
@@ -209,7 +192,7 @@ describe('PlaneClient', () => {
   describe('createWorkItem', () => {
     it('creates a work item with full payload', async () => {
       const item = { id: 'wi1', name: 'New Issue' };
-      mockPost.mockResolvedValueOnce({ data: item });
+      mockFetch.mockResolvedValueOnce(response(item));
 
       const result = await client.createWorkItem('proj-1', {
         name: 'New Issue',
@@ -228,7 +211,7 @@ describe('PlaneClient', () => {
   describe('addComment', () => {
     it('adds a comment to a work item', async () => {
       const comment = { id: 'c1', comment_html: '<p>Test comment</p>' };
-      mockPost.mockResolvedValueOnce({ data: comment });
+      mockFetch.mockResolvedValueOnce(response(comment));
 
       const result = await client.addComment('proj-1', 'wi-1', {
         comment_html: '<p>Test comment</p>',
@@ -245,17 +228,20 @@ describe('PlaneClient', () => {
   describe('updateWorkItem', () => {
     it('updates a work item with partial payload', async () => {
       const updated = { id: 'wi-1', name: 'Updated Issue' };
-      mockPatch.mockResolvedValueOnce({ data: updated });
+      mockFetch.mockResolvedValueOnce(response(updated));
 
       const result = await client.updateWorkItem('proj-1', 'wi-1', {
         name: 'Updated Issue',
       });
 
       expect(result).toEqual(updated);
-      expect(mockPatch).toHaveBeenCalledWith(
-        '/workspaces/test-ws/projects/proj-1/work-items/wi-1/',
-        { name: 'Updated Issue' },
+      expect(String(mockFetch.mock.calls[0][0])).toBe(
+        'https://plane.test.com/api/v1/workspaces/test-ws/projects/proj-1/work-items/wi-1/',
       );
+      expect(mockFetch.mock.calls[0][1]?.method).toBe('PATCH');
+      expect(JSON.parse(String(mockFetch.mock.calls[0][1]?.body))).toEqual({
+        name: 'Updated Issue',
+      });
     });
   });
 
@@ -263,20 +249,18 @@ describe('PlaneClient', () => {
 
   describe('deleteWorkItem', () => {
     it('deletes a work item', async () => {
-      mockDelete.mockResolvedValueOnce({ data: {} });
+      mockFetch.mockResolvedValueOnce(new Response(null, { status: 204 }));
 
       await client.deleteWorkItem('proj-1', 'wi-1');
 
-      expect(mockDelete).toHaveBeenCalledWith(
-        '/workspaces/test-ws/projects/proj-1/work-items/wi-1/',
+      expect(String(mockFetch.mock.calls[0][0])).toBe(
+        'https://plane.test.com/api/v1/workspaces/test-ws/projects/proj-1/work-items/wi-1/',
       );
+      expect(mockFetch.mock.calls[0][1]?.method).toBe('DELETE');
     });
 
     it('throws on API errors', async () => {
-      mockDelete.mockRejectedValueOnce({
-        isAxiosError: true,
-        response: { status: 404, data: 'Not found' },
-      });
+      mockFetch.mockResolvedValueOnce(response('Not found', 404));
 
       await expect(client.deleteWorkItem('proj-1', 'wi-1')).rejects.toThrow(
         /Plane API error 404.*deleting work item/,
@@ -288,10 +272,7 @@ describe('PlaneClient', () => {
 
   describe('error handling', () => {
     it('wraps API errors with status and context', async () => {
-      mockGet.mockRejectedValueOnce({
-        isAxiosError: true,
-        response: { status: 500, data: 'Internal Server Error' },
-      });
+      mockFetch.mockResolvedValueOnce(response('Internal Server Error', 500));
 
       await expect(client.listStates('proj-1')).rejects.toThrow(
         /Plane API error 500.*listing Plane states/,
@@ -299,7 +280,7 @@ describe('PlaneClient', () => {
     });
 
     it('wraps network errors with context', async () => {
-      mockGet.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
 
       await expect(client.listStates('proj-1')).rejects.toThrow(
         /Network error.*listing Plane states/,

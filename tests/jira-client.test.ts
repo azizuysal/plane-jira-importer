@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
@@ -15,28 +15,22 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 vi.mock('../src/utils/helpers.js', async () => {
-  const actual = await vi.importActual<typeof import('../src/utils/helpers.js')>('../src/utils/helpers.js');
+  const actual =
+    await vi.importActual<typeof import('../src/utils/helpers.js')>('../src/utils/helpers.js');
   return {
     ...actual,
     sleep: vi.fn().mockResolvedValue(undefined),
   };
 });
 
-const mockGet = vi.fn();
-const mockPost = vi.fn();
+const mockFetch = vi.fn<typeof fetch>();
 
-vi.mock('axios', () => ({
-  default: {
-    create: vi.fn(() => ({
-      get: mockGet,
-      post: mockPost,
-    })),
-    isAxiosError: vi.fn(
-      (err: unknown) =>
-        typeof err === 'object' && err !== null && 'isAxiosError' in err,
-    ),
-  },
-}));
+function response(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 
 import { JiraClient } from '../src/clients/jira.js';
 
@@ -58,29 +52,33 @@ describe('JiraClient', () => {
   let client: JiraClient;
 
   beforeEach(() => {
-    mockGet.mockReset();
-    mockPost.mockReset();
+    mockFetch.mockReset();
+    vi.stubGlobal('fetch', mockFetch);
     client = createClient();
   });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   // ── listProjects ─────────────────────────────────────────────────────
 
   describe('listProjects', () => {
     it('returns projects from the API', async () => {
       const projects = [{ id: '1', key: 'PROJ', name: 'My Project' }];
-      mockGet.mockResolvedValueOnce({ data: projects });
+      mockFetch.mockResolvedValueOnce(response(projects));
 
       const result = await client.listProjects();
 
       expect(result).toEqual(projects);
-      expect(mockGet).toHaveBeenCalledWith('/rest/api/3/project');
+      expect(String(mockFetch.mock.calls[0][0])).toBe(
+        'https://test.atlassian.net/rest/api/3/project',
+      );
+      expect(new Headers(mockFetch.mock.calls[0][1]?.headers).get('Authorization')).toBe(
+        `Basic ${Buffer.from('test@example.com:test-token').toString('base64')}`,
+      );
     });
 
     it('throws a descriptive error on 401', async () => {
-      mockGet.mockRejectedValueOnce({
-        isAxiosError: true,
-        response: { status: 401, data: { message: 'Unauthorized' } },
-      });
+      mockFetch.mockResolvedValueOnce(response({ message: 'Unauthorized' }, 401));
 
       await expect(client.listProjects()).rejects.toThrow(
         /Jira API error 401.*listing Jira projects/,
@@ -88,7 +86,7 @@ describe('JiraClient', () => {
     });
 
     it('throws on network errors', async () => {
-      mockGet.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
 
       await expect(client.listProjects()).rejects.toThrow(/Network error.*listing Jira projects/);
     });
@@ -105,9 +103,9 @@ describe('JiraClient', () => {
       }));
       const page2 = [{ id: '101', key: 'P-101', fields: { summary: 'Last' } }];
 
-      mockGet
-        .mockResolvedValueOnce({ data: { issues: page1, nextPageToken: 'tok-2', isLast: false } })
-        .mockResolvedValueOnce({ data: { issues: page2, isLast: true } });
+      mockFetch
+        .mockResolvedValueOnce(response({ issues: page1, nextPageToken: 'tok-2', isLast: false }))
+        .mockResolvedValueOnce(response({ issues: page2, isLast: true }));
 
       const result = await client.searchIssues('PROJ');
 
@@ -116,25 +114,29 @@ describe('JiraClient', () => {
       expect(result[100].key).toBe('P-101');
 
       // First page must not send a token; second must send the one it got.
-      expect(mockGet.mock.calls[0][1].params.nextPageToken).toBeUndefined();
-      expect(mockGet.mock.calls[1][1].params.nextPageToken).toBe('tok-2');
-      expect(mockGet.mock.calls[0][1].params.startAt).toBeUndefined();
-      expect(mockGet.mock.calls[1][1].params.startAt).toBeUndefined();
-      expect(mockGet).toHaveBeenCalledTimes(2);
+      expect(
+        new URL(String(mockFetch.mock.calls[0][0])).searchParams.get('nextPageToken'),
+      ).toBeNull();
+      expect(new URL(String(mockFetch.mock.calls[1][0])).searchParams.get('nextPageToken')).toBe(
+        'tok-2',
+      );
+      expect(new URL(String(mockFetch.mock.calls[0][0])).searchParams.get('startAt')).toBeNull();
+      expect(new URL(String(mockFetch.mock.calls[1][0])).searchParams.get('startAt')).toBeNull();
+      expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
     it('handles a single page of results', async () => {
-      mockGet.mockResolvedValueOnce({
-        data: {
+      mockFetch.mockResolvedValueOnce(
+        response({
           issues: [{ id: '1', key: 'P-1', fields: { summary: 'Only' } }],
           isLast: true,
-        },
-      });
+        }),
+      );
 
       const result = await client.searchIssues('PROJ');
 
       expect(result).toHaveLength(1);
-      expect(mockGet).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it('stops after exactly 100 issues when the API marks the page as last', async () => {
@@ -144,63 +146,71 @@ describe('JiraClient', () => {
         fields: { summary: `Issue ${i + 1}` },
       }));
 
-      mockGet.mockResolvedValueOnce({ data: { issues: page, isLast: true } });
+      mockFetch.mockResolvedValueOnce(response({ issues: page, isLast: true }));
 
       const result = await client.searchIssues('PROJ');
 
       expect(result).toHaveLength(100);
-      expect(mockGet).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it('returns an empty project when the API marks the page as last', async () => {
-      mockGet.mockResolvedValueOnce({ data: { issues: [], isLast: true } });
+      mockFetch.mockResolvedValueOnce(response({ issues: [], isLast: true }));
 
       await expect(client.searchIssues('PROJ')).resolves.toEqual([]);
-      expect(mockGet).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
-    it.each([undefined, ''])('rejects incomplete results when the next token is %s', async (nextPageToken) => {
-      mockGet
-        .mockResolvedValueOnce({
-          data: {
-            issues: [{ id: '1', key: 'P-1', fields: { summary: 'First' } }],
-            nextPageToken: 'tok-2',
-            isLast: false,
-          },
-        })
-        .mockResolvedValueOnce({
-          data: {
-            issues: [{ id: '2', key: 'P-2', fields: { summary: 'Second' } }],
-            nextPageToken,
-            isLast: false,
-          },
-        });
+    it.each([undefined, ''])(
+      'rejects incomplete results when the next token is %s',
+      async (nextPageToken) => {
+        mockFetch
+          .mockResolvedValueOnce(
+            response({
+              issues: [{ id: '1', key: 'P-1', fields: { summary: 'First' } }],
+              nextPageToken: 'tok-2',
+              isLast: false,
+            }),
+          )
+          .mockResolvedValueOnce(
+            response({
+              issues: [{ id: '2', key: 'P-2', fields: { summary: 'Second' } }],
+              nextPageToken,
+              isLast: false,
+            }),
+          );
 
-      await expect(client.searchIssues('PROJ')).rejects.toThrow(
-        /Jira pagination error.*PROJ.*page 2.*missing nextPageToken/,
-      );
-      expect(mockGet).toHaveBeenCalledTimes(2);
-    });
+        await expect(client.searchIssues('PROJ')).rejects.toThrow(
+          /Jira pagination error.*PROJ.*page 2.*missing nextPageToken/,
+        );
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      },
+    );
 
     it('rejects results without a completion marker or next token', async () => {
-      mockGet.mockResolvedValueOnce({
-        data: { issues: [{ id: '1', key: 'P-1', fields: { summary: 'Incomplete' } }] },
-      });
+      mockFetch.mockResolvedValueOnce(
+        response({ issues: [{ id: '1', key: 'P-1', fields: { summary: 'Incomplete' } }] }),
+      );
 
       await expect(client.searchIssues('PROJ')).rejects.toThrow(
         /Jira pagination error.*PROJ.*page 1.*missing nextPageToken/,
       );
-      expect(mockGet).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it('de-duplicates issues repeated across overlapping pages', async () => {
       const shared = { id: '1', key: 'P-1', fields: { summary: 'Dup' } };
 
-      mockGet
-        .mockResolvedValueOnce({ data: { issues: [shared], nextPageToken: 'tok-2', isLast: false } })
-        .mockResolvedValueOnce({
-          data: { issues: [shared, { id: '2', key: 'P-2', fields: { summary: 'New' } }], isLast: true },
-        });
+      mockFetch
+        .mockResolvedValueOnce(
+          response({ issues: [shared], nextPageToken: 'tok-2', isLast: false }),
+        )
+        .mockResolvedValueOnce(
+          response({
+            issues: [shared, { id: '2', key: 'P-2', fields: { summary: 'New' } }],
+            isLast: true,
+          }),
+        );
 
       const result = await client.searchIssues('PROJ');
 
@@ -209,30 +219,30 @@ describe('JiraClient', () => {
     });
 
     it('rejects incomplete results if the API keeps returning the same token', async () => {
-      mockGet.mockResolvedValue({
-        data: {
+      mockFetch.mockImplementation(async () =>
+        response({
           issues: [{ id: '1', key: 'P-1', fields: { summary: 'Stuck' } }],
           nextPageToken: 'same',
           isLast: false,
-        },
-      });
+        }),
+      );
 
       await expect(client.searchIssues('PROJ')).rejects.toThrow(
         /Jira pagination error.*PROJ.*page 2.*repeated nextPageToken/,
       );
-      expect(mockGet).toHaveBeenCalledTimes(2);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
     it('rejects incomplete results if the API cycles through previously seen tokens', async () => {
-      mockGet
-        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-2', isLast: false } })
-        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-3', isLast: false } })
-        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-2', isLast: false } });
+      mockFetch
+        .mockResolvedValueOnce(response({ issues: [], nextPageToken: 'tok-2', isLast: false }))
+        .mockResolvedValueOnce(response({ issues: [], nextPageToken: 'tok-3', isLast: false }))
+        .mockResolvedValueOnce(response({ issues: [], nextPageToken: 'tok-2', isLast: false }));
 
       await expect(client.searchIssues('PROJ')).rejects.toThrow(
         /Jira pagination error.*PROJ.*page 3.*repeated nextPageToken/,
       );
-      expect(mockGet).toHaveBeenCalledTimes(3);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -247,14 +257,14 @@ describe('JiraClient', () => {
         renderedFields: { description: '<p>HTML</p>' },
       };
 
-      mockGet.mockResolvedValueOnce({ data: issue });
+      mockFetch.mockResolvedValueOnce(response(issue));
 
       const result = await client.getIssue('PROJ-1');
 
       expect(result).toEqual(issue);
-      expect(mockGet).toHaveBeenCalledWith('/rest/api/3/issue/PROJ-1', {
-        params: { expand: 'renderedFields' },
-      });
+      const url = new URL(String(mockFetch.mock.calls[0][0]));
+      expect(url.pathname).toBe('/rest/api/3/issue/PROJ-1');
+      expect(url.searchParams.get('expand')).toBe('renderedFields');
     });
   });
 
@@ -262,8 +272,8 @@ describe('JiraClient', () => {
 
   describe('getComments', () => {
     it('fetches all comments for an issue', async () => {
-      mockGet.mockResolvedValueOnce({
-        data: {
+      mockFetch.mockResolvedValueOnce(
+        response({
           comments: [
             { id: '1', renderedBody: '<p>Comment 1</p>' },
             { id: '2', renderedBody: '<p>Comment 2</p>' },
@@ -271,8 +281,8 @@ describe('JiraClient', () => {
           total: 2,
           startAt: 0,
           maxResults: 100,
-        },
-      });
+        }),
+      );
 
       const result = await client.getComments('PROJ-1');
 
@@ -343,15 +353,24 @@ describe('JiraClient', () => {
   describe('downloadAttachment', () => {
     it('downloads attachment content as a Buffer', async () => {
       const arrayBuf = new ArrayBuffer(8);
-      mockGet.mockResolvedValueOnce({ data: arrayBuf });
+      mockFetch.mockResolvedValueOnce(new Response(arrayBuf));
 
-      const result = await client.downloadAttachment('https://jira.example.com/file.png');
+      const result = await client.downloadAttachment('https://test.atlassian.net/file.png');
 
       expect(result).toBeInstanceOf(Buffer);
-      expect(mockGet).toHaveBeenCalledWith('https://jira.example.com/file.png', {
-        responseType: 'arraybuffer',
-        baseURL: '',
-      });
+      expect(result).toEqual(Buffer.from(arrayBuf));
+      expect(String(mockFetch.mock.calls[0][0])).toBe('https://test.atlassian.net/file.png');
+      expect(new Headers(mockFetch.mock.calls[0][1]?.headers).get('Authorization')).toMatch(
+        /^Basic /,
+      );
+    });
+
+    it('does not send Jira credentials to signed storage URLs', async () => {
+      mockFetch.mockResolvedValueOnce(new Response('attachment'));
+
+      await client.downloadAttachment('https://storage.example.com/file.png?signature=test');
+
+      expect(new Headers(mockFetch.mock.calls[0][1]?.headers).has('Authorization')).toBe(false);
     });
   });
 });

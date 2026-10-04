@@ -33,9 +33,13 @@ Written in **TypeScript** with full type safety, built for reliability at scale.
 
 ## Prerequisites
 
-- Node.js 18+ (22 recommended — see `.mise.toml`)
+- Node.js 22.21+ for source development, builds, and tests (see `.mise.toml`)
+- The built CLI supports Node.js 18+; use Node.js 22.21+ when a proxy is required
 - Jira Cloud account with API token
 - Plane instance with API key
+
+Node.js 18 emits an experimental File API warning during attachment uploads.
+Use Node.js 22.21+ to avoid this warning.
 
 ## Setup
 
@@ -50,6 +54,20 @@ npm install
 cp .env.example .env
 # Edit .env with your credentials
 ```
+
+### HTTP proxies
+
+Requests use Node.js native `fetch`. To use `HTTP_PROXY`, `HTTPS_PROXY`, and
+`NO_PROXY`, run with Node.js 22.21+ and enable proxy support when starting Node:
+
+```bash
+NODE_USE_ENV_PROXY=1 npm start
+# Or run the built CLI:
+NODE_USE_ENV_PROXY=1 node dist/index.js
+```
+
+Older Node.js versions cannot use these proxy settings with this importer.
+Node.js 22.22.3 emits an experimental EnvHttpProxyAgent warning with this option.
 
 ### Getting Jira credentials
 

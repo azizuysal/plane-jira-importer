@@ -6,8 +6,8 @@
  * exponential backoff.
  */
 
-import axios from 'axios';
-import type { AxiosInstance } from 'axios';
+import { HttpError, httpRequest, jsonRequest } from '../utils/http.js';
+import type { JsonRequestOptions } from '../utils/http.js';
 import { log } from '../utils/logger.js';
 import { withRetry } from '../utils/retry.js';
 import { mimeFromFilename } from '../utils/helpers.js';
@@ -30,7 +30,8 @@ import type {
 } from '../types/jira.js';
 
 export class JiraClient {
-  private readonly client: AxiosInstance;
+  private readonly baseUrl: string;
+  private readonly headers: HeadersInit;
   private readonly rateLimiter: IRateLimiter;
   private readonly maxRetries: number;
   readonly host: string;
@@ -38,15 +39,8 @@ export class JiraClient {
   constructor(config: JiraConfig) {
     const base64 = Buffer.from(`${config.email}:${config.apiToken}`).toString('base64');
 
-    this.client = axios.create({
-      baseURL: `https://${config.host}`,
-      headers: {
-        Authorization: `Basic ${base64}`,
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      timeout: 30_000,
-    });
+    this.baseUrl = `https://${config.host}`;
+    this.headers = { Authorization: `Basic ${base64}` };
 
     this.host = config.host;
     this.rateLimiter = config.rateLimiter;
@@ -57,13 +51,10 @@ export class JiraClient {
 
   /** List all Jira projects visible to the authenticated user. */
   async listProjects(): Promise<JiraProject[]> {
-    return this.apiCall(
-      async () => {
-        const { data } = await this.client.get<JiraProject[]>('/rest/api/3/project');
-        return data;
-      },
-      'listing Jira projects',
-    );
+    return this.apiCall(async () => {
+      const data = await this.request<JiraProject[]>('/rest/api/3/project');
+      return data;
+    }, 'listing Jira projects');
   }
 
   // ── Issues ───────────────────────────────────────────────────────────────
@@ -90,21 +81,18 @@ export class JiraClient {
     for (;;) {
       const token = nextPageToken;
 
-      const data = await this.apiCall(
-        async () => {
-          const { data } = await this.client.get<JiraSearchResponse>('/rest/api/3/search/jql', {
-            params: {
-              jql: `project = "${projectKey}" ORDER BY created ASC`,
-              maxResults,
-              ...(token ? { nextPageToken: token } : {}),
-              fields:
-                'summary,status,priority,issuetype,created,updated,assignee,reporter,creator,labels,parent,customfield_10015,duedate,attachment',
-            },
-          });
-          return data;
-        },
-        `searching issues (page ${page})`,
-      );
+      const data = await this.apiCall(async () => {
+        const data = await this.request<JiraSearchResponse>('/rest/api/3/search/jql', {
+          params: {
+            jql: `project = "${projectKey}" ORDER BY created ASC`,
+            maxResults,
+            ...(token ? { nextPageToken: token } : {}),
+            fields:
+              'summary,status,priority,issuetype,created,updated,assignee,reporter,creator,labels,parent,customfield_10015,duedate,attachment',
+          },
+        });
+        return data;
+      }, `searching issues (page ${page})`);
 
       const fetched = data.issues;
 
@@ -139,15 +127,12 @@ export class JiraClient {
 
   /** Get a single issue with rendered (HTML) fields. */
   async getIssue(issueKey: string): Promise<JiraIssue> {
-    return this.apiCall(
-      async () => {
-        const { data } = await this.client.get<JiraIssue>(`/rest/api/3/issue/${issueKey}`, {
-          params: { expand: 'renderedFields' },
-        });
-        return data;
-      },
-      `fetching issue ${issueKey}`,
-    );
+    return this.apiCall(async () => {
+      const data = await this.request<JiraIssue>(`/rest/api/3/issue/${issueKey}`, {
+        params: { expand: 'renderedFields' },
+      });
+      return data;
+    }, `fetching issue ${issueKey}`);
   }
 
   // ── Attachments ──────────────────────────────────────────────────────────
@@ -176,19 +161,17 @@ export class JiraClient {
   /**
    * Download an attachment as a Buffer.
    *
-   * The `contentUrl` is an absolute URL that still requires authentication.
+   * Jira URLs receive authentication; signed storage URLs do not.
    */
   async downloadAttachment(contentUrl: string): Promise<Buffer> {
-    return this.apiCall(
-      async () => {
-        const { data } = await this.client.get<ArrayBuffer>(contentUrl, {
-          responseType: 'arraybuffer',
-          baseURL: '', // contentUrl is absolute
-        });
-        return Buffer.from(data);
-      },
-      `downloading attachment from ${contentUrl}`,
-    );
+    return this.apiCall(async () => {
+      const url = new URL(contentUrl);
+      const response = await httpRequest(url, {
+        headers: url.origin === new URL(this.baseUrl).origin ? this.headers : undefined,
+        redirect: 'follow',
+      });
+      return Buffer.from(await response.arrayBuffer());
+    }, 'downloading Jira attachment');
   }
 
   // ── Comments ─────────────────────────────────────────────────────────────
@@ -204,16 +187,13 @@ export class JiraClient {
     const maxResults = 100;
 
     for (;;) {
-      const data = await this.apiCall(
-        async () => {
-          const { data } = await this.client.get<JiraCommentsResponse>(
-            `/rest/api/3/issue/${issueKey}/comment`,
-            { params: { maxResults, startAt, expand: 'renderedBody' } },
-          );
-          return data;
-        },
-        `fetching comments for ${issueKey} (offset ${startAt})`,
-      );
+      const data = await this.apiCall(async () => {
+        const data = await this.request<JiraCommentsResponse>(
+          `/rest/api/3/issue/${issueKey}/comment`,
+          { params: { maxResults, startAt, expand: 'renderedBody' } },
+        );
+        return data;
+      }, `fetching comments for ${issueKey} (offset ${startAt})`);
 
       comments.push(...data.comments);
 
@@ -247,28 +227,13 @@ export class JiraClient {
     }
   }
 
-  /**
-   * Translate Axios errors into human-readable `Error` instances.
-   *
-   * Always throws — the `never` return type lets callers skip an explicit
-   * return after the catch block.
-   */
+  private request<T>(path: string, options: JsonRequestOptions = {}): Promise<T> {
+    return jsonRequest<T>(`${this.baseUrl}${path}`, { ...options, headers: this.headers });
+  }
+
   private handleError(err: unknown, context: string): never {
-    if (axios.isAxiosError(err) && err.response) {
-      const { status } = err.response;
-      const data = err.response.data as Record<string, unknown> | undefined;
-      const errorMessages = data?.errorMessages;
-      let msg: string;
-
-      if (Array.isArray(errorMessages)) {
-        msg = (errorMessages as string[]).join(', ');
-      } else if (typeof data?.message === 'string') {
-        msg = data.message;
-      } else {
-        msg = JSON.stringify(data);
-      }
-
-      throw new Error(`Jira API error ${status} while ${context}: ${msg}`);
+    if (err instanceof HttpError) {
+      throw new Error(`Jira API error ${err.status} while ${context}: ${err.message}`);
     }
 
     const message = err instanceof Error ? err.message : String(err);
