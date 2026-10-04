@@ -97,34 +97,37 @@ describe('JiraClient', () => {
   // ── searchIssues ─────────────────────────────────────────────────────
 
   describe('searchIssues', () => {
-    it('returns all issues across multiple pages', async () => {
-      // First page: exactly 100 items (maxResults) triggers next page fetch
+    it('follows nextPageToken across multiple pages', async () => {
       const page1 = Array.from({ length: 100 }, (_, i) => ({
         id: String(i + 1),
         key: `P-${i + 1}`,
         fields: { summary: `Issue ${i + 1}` },
       }));
-      // Second page: fewer than 100 → last page
       const page2 = [{ id: '101', key: 'P-101', fields: { summary: 'Last' } }];
 
       mockGet
-        .mockResolvedValueOnce({ data: { issues: page1 } })
-        .mockResolvedValueOnce({ data: { issues: page2 } });
+        .mockResolvedValueOnce({ data: { issues: page1, nextPageToken: 'tok-2', isLast: false } })
+        .mockResolvedValueOnce({ data: { issues: page2, isLast: true } });
 
       const result = await client.searchIssues('PROJ');
 
       expect(result).toHaveLength(101);
       expect(result[0].key).toBe('P-1');
       expect(result[100].key).toBe('P-101');
+
+      // First page must not send a token; second must send the one it got.
+      expect(mockGet.mock.calls[0][1].params.nextPageToken).toBeUndefined();
+      expect(mockGet.mock.calls[1][1].params.nextPageToken).toBe('tok-2');
+      expect(mockGet.mock.calls[0][1].params.startAt).toBeUndefined();
+      expect(mockGet.mock.calls[1][1].params.startAt).toBeUndefined();
+      expect(mockGet).toHaveBeenCalledTimes(2);
     });
 
     it('handles a single page of results', async () => {
       mockGet.mockResolvedValueOnce({
         data: {
           issues: [{ id: '1', key: 'P-1', fields: { summary: 'Only' } }],
-          total: 1,
-          startAt: 0,
-          maxResults: 100,
+          isLast: true,
         },
       });
 
@@ -132,6 +135,104 @@ describe('JiraClient', () => {
 
       expect(result).toHaveLength(1);
       expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops after exactly 100 issues when the API marks the page as last', async () => {
+      const page = Array.from({ length: 100 }, (_, i) => ({
+        id: String(i + 1),
+        key: `P-${i + 1}`,
+        fields: { summary: `Issue ${i + 1}` },
+      }));
+
+      mockGet.mockResolvedValueOnce({ data: { issues: page, isLast: true } });
+
+      const result = await client.searchIssues('PROJ');
+
+      expect(result).toHaveLength(100);
+      expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns an empty project when the API marks the page as last', async () => {
+      mockGet.mockResolvedValueOnce({ data: { issues: [], isLast: true } });
+
+      await expect(client.searchIssues('PROJ')).resolves.toEqual([]);
+      expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([undefined, ''])('rejects incomplete results when the next token is %s', async (nextPageToken) => {
+      mockGet
+        .mockResolvedValueOnce({
+          data: {
+            issues: [{ id: '1', key: 'P-1', fields: { summary: 'First' } }],
+            nextPageToken: 'tok-2',
+            isLast: false,
+          },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            issues: [{ id: '2', key: 'P-2', fields: { summary: 'Second' } }],
+            nextPageToken,
+            isLast: false,
+          },
+        });
+
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 2.*missing nextPageToken/,
+      );
+      expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects results without a completion marker or next token', async () => {
+      mockGet.mockResolvedValueOnce({
+        data: { issues: [{ id: '1', key: 'P-1', fields: { summary: 'Incomplete' } }] },
+      });
+
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 1.*missing nextPageToken/,
+      );
+      expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
+    it('de-duplicates issues repeated across overlapping pages', async () => {
+      const shared = { id: '1', key: 'P-1', fields: { summary: 'Dup' } };
+
+      mockGet
+        .mockResolvedValueOnce({ data: { issues: [shared], nextPageToken: 'tok-2', isLast: false } })
+        .mockResolvedValueOnce({
+          data: { issues: [shared, { id: '2', key: 'P-2', fields: { summary: 'New' } }], isLast: true },
+        });
+
+      const result = await client.searchIssues('PROJ');
+
+      expect(result).toHaveLength(2);
+      expect(result.map((i) => i.key)).toEqual(['P-1', 'P-2']);
+    });
+
+    it('rejects incomplete results if the API keeps returning the same token', async () => {
+      mockGet.mockResolvedValue({
+        data: {
+          issues: [{ id: '1', key: 'P-1', fields: { summary: 'Stuck' } }],
+          nextPageToken: 'same',
+          isLast: false,
+        },
+      });
+
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 2.*repeated nextPageToken/,
+      );
+      expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects incomplete results if the API cycles through previously seen tokens', async () => {
+      mockGet
+        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-2', isLast: false } })
+        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-3', isLast: false } })
+        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-2', isLast: false } });
+
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 3.*repeated nextPageToken/,
+      );
+      expect(mockGet).toHaveBeenCalledTimes(3);
     });
   });
 

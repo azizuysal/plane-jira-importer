@@ -71,37 +71,67 @@ export class JiraClient {
   /**
    * Fetch all issues for a project using JQL pagination.
    *
+   * `/rest/api/3/search/jql` paginates by opaque token, not by offset — it
+   * ignores `startAt` entirely and returns the same first page for every
+   * offset. Pages are followed via `nextPageToken` until `isLast` is set.
+   *
    * Each page is individually retried on transient failures.
    * Returns the full list of issue summaries (not expanded).
    */
   async searchIssues(projectKey: string): Promise<JiraIssue[]> {
     const issues: JiraIssue[] = [];
-    let startAt = 0;
+    const seenKeys = new Set<string>();
+    const seenTokens = new Set<string>();
     const maxResults = 100;
 
+    let nextPageToken: string | undefined;
+    let page = 1;
+
     for (;;) {
+      const token = nextPageToken;
+
       const data = await this.apiCall(
         async () => {
           const { data } = await this.client.get<JiraSearchResponse>('/rest/api/3/search/jql', {
             params: {
               jql: `project = "${projectKey}" ORDER BY created ASC`,
               maxResults,
-              startAt,
+              ...(token ? { nextPageToken: token } : {}),
               fields:
                 'summary,status,priority,issuetype,created,updated,assignee,reporter,creator,labels,parent,customfield_10015,duedate,attachment',
             },
           });
           return data;
         },
-        `searching issues (offset ${startAt})`,
+        `searching issues (page ${page})`,
       );
 
-      const fetched = data.issues ?? [];
-      issues.push(...fetched);
+      const fetched = data.issues;
+
+      // Pages can overlap; de-duplicate so a repeated issue is counted once.
+      for (const issue of fetched) {
+        if (!seenKeys.has(issue.key)) {
+          seenKeys.add(issue.key);
+          issues.push(issue);
+        }
+      }
       log.dim(`  Fetched ${issues.length} issues so far`);
 
-      if (fetched.length === 0 || fetched.length < maxResults) break;
-      startAt += maxResults;
+      if (data.isLast === true) break;
+      if (!data.nextPageToken) {
+        throw new Error(
+          `Jira pagination error for ${projectKey} on page ${page}: missing nextPageToken before isLast is true`,
+        );
+      }
+      if (seenTokens.has(data.nextPageToken)) {
+        throw new Error(
+          `Jira pagination error for ${projectKey} on page ${page}: repeated nextPageToken before isLast is true`,
+        );
+      }
+
+      seenTokens.add(data.nextPageToken);
+      nextPageToken = data.nextPageToken;
+      page++;
     }
 
     return issues;
