@@ -81,6 +81,7 @@ export class JiraClient {
   async searchIssues(projectKey: string): Promise<JiraIssue[]> {
     const issues: JiraIssue[] = [];
     const seenKeys = new Set<string>();
+    const seenTokens = new Set<string>();
     const maxResults = 100;
 
     let nextPageToken: string | undefined;
@@ -105,7 +106,7 @@ export class JiraClient {
         `searching issues (page ${page})`,
       );
 
-      const fetched = data.issues ?? [];
+      const fetched = data.issues;
 
       // Pages can overlap; de-duplicate so a repeated issue is counted once.
       for (const issue of fetched) {
@@ -116,10 +117,19 @@ export class JiraClient {
       }
       log.dim(`  Fetched ${issues.length} issues so far`);
 
-      // Stop when the API says this was the last page, when it hands back no
-      // token, or when the token stops advancing (guards against a loop).
-      if (data.isLast === true || !data.nextPageToken || data.nextPageToken === token) break;
+      if (data.isLast === true) break;
+      if (!data.nextPageToken) {
+        throw new Error(
+          `Jira pagination error for ${projectKey} on page ${page}: missing nextPageToken before isLast is true`,
+        );
+      }
+      if (seenTokens.has(data.nextPageToken)) {
+        throw new Error(
+          `Jira pagination error for ${projectKey} on page ${page}: repeated nextPageToken before isLast is true`,
+        );
+      }
 
+      seenTokens.add(data.nextPageToken);
       nextPageToken = data.nextPageToken;
       page++;
     }

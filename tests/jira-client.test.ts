@@ -118,6 +118,9 @@ describe('JiraClient', () => {
       // First page must not send a token; second must send the one it got.
       expect(mockGet.mock.calls[0][1].params.nextPageToken).toBeUndefined();
       expect(mockGet.mock.calls[1][1].params.nextPageToken).toBe('tok-2');
+      expect(mockGet.mock.calls[0][1].params.startAt).toBeUndefined();
+      expect(mockGet.mock.calls[1][1].params.startAt).toBeUndefined();
+      expect(mockGet).toHaveBeenCalledTimes(2);
     });
 
     it('handles a single page of results', async () => {
@@ -134,18 +137,59 @@ describe('JiraClient', () => {
       expect(mockGet).toHaveBeenCalledTimes(1);
     });
 
-    it('stops when a full page arrives without a token', async () => {
+    it('stops after exactly 100 issues when the API marks the page as last', async () => {
       const page = Array.from({ length: 100 }, (_, i) => ({
         id: String(i + 1),
         key: `P-${i + 1}`,
         fields: { summary: `Issue ${i + 1}` },
       }));
 
-      mockGet.mockResolvedValueOnce({ data: { issues: page } });
+      mockGet.mockResolvedValueOnce({ data: { issues: page, isLast: true } });
 
       const result = await client.searchIssues('PROJ');
 
       expect(result).toHaveLength(100);
+      expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns an empty project when the API marks the page as last', async () => {
+      mockGet.mockResolvedValueOnce({ data: { issues: [], isLast: true } });
+
+      await expect(client.searchIssues('PROJ')).resolves.toEqual([]);
+      expect(mockGet).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([undefined, ''])('rejects incomplete results when the next token is %s', async (nextPageToken) => {
+      mockGet
+        .mockResolvedValueOnce({
+          data: {
+            issues: [{ id: '1', key: 'P-1', fields: { summary: 'First' } }],
+            nextPageToken: 'tok-2',
+            isLast: false,
+          },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            issues: [{ id: '2', key: 'P-2', fields: { summary: 'Second' } }],
+            nextPageToken,
+            isLast: false,
+          },
+        });
+
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 2.*missing nextPageToken/,
+      );
+      expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects results without a completion marker or next token', async () => {
+      mockGet.mockResolvedValueOnce({
+        data: { issues: [{ id: '1', key: 'P-1', fields: { summary: 'Incomplete' } }] },
+      });
+
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 1.*missing nextPageToken/,
+      );
       expect(mockGet).toHaveBeenCalledTimes(1);
     });
 
@@ -164,15 +208,31 @@ describe('JiraClient', () => {
       expect(result.map((i) => i.key)).toEqual(['P-1', 'P-2']);
     });
 
-    it('terminates if the API keeps returning the same token', async () => {
+    it('rejects incomplete results if the API keeps returning the same token', async () => {
       mockGet.mockResolvedValue({
-        data: { issues: [{ id: '1', key: 'P-1', fields: { summary: 'Stuck' } }], nextPageToken: 'same' },
+        data: {
+          issues: [{ id: '1', key: 'P-1', fields: { summary: 'Stuck' } }],
+          nextPageToken: 'same',
+          isLast: false,
+        },
       });
 
-      const result = await client.searchIssues('PROJ');
-
-      expect(result).toHaveLength(1);
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 2.*repeated nextPageToken/,
+      );
       expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects incomplete results if the API cycles through previously seen tokens', async () => {
+      mockGet
+        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-2', isLast: false } })
+        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-3', isLast: false } })
+        .mockResolvedValueOnce({ data: { issues: [], nextPageToken: 'tok-2', isLast: false } });
+
+      await expect(client.searchIssues('PROJ')).rejects.toThrow(
+        /Jira pagination error.*PROJ.*page 3.*repeated nextPageToken/,
+      );
+      expect(mockGet).toHaveBeenCalledTimes(3);
     });
   });
 
