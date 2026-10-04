@@ -1,5 +1,0 @@
-# Snyk policy file — suppress false positives
-version: v1.25.0
-exclude:
-  code:
-    - tests/**
