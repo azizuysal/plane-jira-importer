@@ -16,11 +16,11 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import type { JiraClient } from '../clients/jira.js';
 import type { PlaneClient } from '../clients/plane.js';
-import type { JiraIssue, JiraComment } from '../types/jira.js';
+import type { JiraIssue, JiraComment, JiraUser } from '../types/jira.js';
 import type { CreateWorkItemPayload, CreateCommentPayload } from '../types/plane.js';
-import type { MigrationConfig } from '../types/config.js';
+import type { MigrationConfig, StateMappingFile, UsersFile } from '../types/config.js';
 import { log } from '../utils/logger.js';
-import { formatDate, formatSize, formatDuration, progress } from '../utils/helpers.js';
+import { escapeHtml, formatDate, formatSize, formatDuration, progress } from '../utils/helpers.js';
 import {
   mapPriority,
   buildStatusMap,
@@ -42,6 +42,8 @@ export interface MigrationOptions {
   dryRun: boolean;
   reimport: boolean;
   config: MigrationConfig;
+  usersFile?: UsersFile;
+  stateMappingFile?: StateMappingFile;
 }
 
 /** Internal parameters passed to the single-issue migration helper. */
@@ -126,7 +128,7 @@ export async function runMigration(options: MigrationOptions): Promise<void> {
   log.heading('Fetching Plane metadata');
   const [planeStates, planeMembers, existingWorkItems] = await Promise.all([
     plane.listStates(planeProjectId),
-    plane.listMembers(),
+    plane.listMembers(planeProjectId),
     plane.listWorkItems(planeProjectId),
   ]);
 
@@ -147,14 +149,19 @@ export async function runMigration(options: MigrationOptions): Promise<void> {
   }
 
   // ── Update/reimport decision ─────────────────────────────────────────
-  const shouldUpdate = await resolveUpdateMode(reimport, migratedKeys.size, dryRun);
+  const shouldUpdate = await resolveUpdateMode(
+    reimport,
+    migratedKeys.size,
+    dryRun,
+    !!options.usersFile && !!options.stateMappingFile,
+  );
 
   // ── Build mappings ─────────────────────────────────────────────────────
   log.heading('Building status mapping');
-  const statusMap = await buildStatusMap(statuses, planeStates);
+  const statusMap = await buildStatusMap(statuses, planeStates, options.stateMappingFile);
 
   log.heading('Building user mapping');
-  const userMap = await buildUserMap(assignees, planeMembers);
+  const userMap = await buildUserMap(assignees, planeMembers, options.usersFile);
 
   // ── Label cache ────────────────────────────────────────────────────────
   const labelCache = new Map<string, string>();
@@ -242,9 +249,14 @@ async function resolveUpdateMode(
   reimport: boolean,
   migratedCount: number,
   dryRun: boolean,
+  fileMappings: boolean,
 ): Promise<boolean> {
   if (reimport) return true;
   if (migratedCount === 0 || dryRun) return false;
+  if (fileMappings) {
+    log.info(`Skipping ${migratedCount} previously migrated issues; use --reimport to update them`);
+    return false;
+  }
 
   const { mode } = await inquirer.prompt([
     {
@@ -291,11 +303,15 @@ async function migrateAll(params: MigrateAllParams): Promise<MigrationStats> {
   for (let i = 0; i < issues.length; i++) {
     const issue = issues[i];
     try {
+      const existingWorkItemId = params.workItemMap.get(issue.key);
       const result = await migrateIssue({
-        ...params, issue, index: i + 1, total: issues.length,
-        existingWorkItemId: params.workItemMap.get(issue.key),
+        ...params,
+        issue,
+        index: i + 1,
+        total: issues.length,
+        existingWorkItemId,
       });
-      accumulateResult(stats, result, !!params.workItemMap.get(issue.key));
+      accumulateResult(stats, result, !!existingWorkItemId);
     } catch (err: unknown) {
       stats.failed++;
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -329,7 +345,9 @@ async function migrateIssue(params: MigrateIssueParams): Promise<IssueResult> {
     attachmentsMigrated: 0, attachmentsSkipped: 0, attachmentsFailed: 0,
   };
 
-  log.info(`${progress(index, total)} ${isUpdate ? 'Updating' : 'Migrating'} ${issue.key}: ${issue.fields.summary}`);
+  log.info(
+    `${progress(index, total)} ${isUpdate ? 'Updating' : 'Migrating'} ${issue.key}: ${issue.fields.summary}`,
+  );
 
   const fullIssue = await jira.getIssue(issue.key);
   const payload = await buildWorkItemPayload({ issue, fullIssue, params });
@@ -339,6 +357,11 @@ async function migrateIssue(params: MigrateIssueParams): Promise<IssueResult> {
     : (await plane.createWorkItem(planeProjectId, payload)).id;
 
   params.workItemMap.set(issue.key, workItemId);
+
+  // Plane v1 applies a project's default assignee on creation, even for an empty list.
+  if (!isUpdate && payload.assignees?.length === 0) {
+    await plane.updateWorkItem(planeProjectId, workItemId, { assignees: [] });
+  }
 
   const [existingCommentIds, existingAttachmentIds] = isUpdate
     ? await Promise.all([
@@ -376,7 +399,14 @@ async function buildWorkItemPayload(args: BuildPayloadArgs): Promise<CreateWorkI
 
   const jiraLink = `https://${jira.host}/browse/${issue.key}`;
   const renderedDesc = fullIssue.renderedFields?.description ?? '';
-  const descriptionHtml = `<p><a href="${jiraLink}" target="_blank">🔗 ${issue.key} on Jira</a></p>${renderedDesc}`;
+  const attribution: string[] = [];
+  if (issue.fields.assignee && !userMap[issue.fields.assignee.accountId]) {
+    attribution.push(originalUser('assignee', issue.fields.assignee));
+  }
+  if (issue.fields.reporter) {
+    attribution.push(originalUser('reporter', issue.fields.reporter));
+  }
+  const descriptionHtml = `<p><a href="${escapeHtml(jiraLink)}" target="_blank">${escapeHtml(issue.key)} on Jira</a></p>${attribution.join('')}${renderedDesc}`;
 
   const priority = mapPriority(issue.fields.priority?.name ?? null);
   const stateId = issue.fields.status?.name ? statusMap[issue.fields.status.name] : undefined;
@@ -388,7 +418,12 @@ async function buildWorkItemPayload(args: BuildPayloadArgs): Promise<CreateWorkI
 
   const labelIds: string[] = [];
   if (issue.fields.issuetype?.name) {
-    const labelId = await ensureTypeLabel(plane, planeProjectId, issue.fields.issuetype.name, labelCache);
+    const labelId = await ensureTypeLabel(
+      plane,
+      planeProjectId,
+      issue.fields.issuetype.name,
+      labelCache,
+    );
     if (labelId) labelIds.push(labelId);
   }
 
@@ -399,12 +434,18 @@ async function buildWorkItemPayload(args: BuildPayloadArgs): Promise<CreateWorkI
     external_id: issue.key,
     external_source: 'jira-importer',
     state: stateId,
-    assignees: assigneeIds.length > 0 ? assigneeIds : undefined,
+    assignees: assigneeIds,
     labels: labelIds.length > 0 ? labelIds : undefined,
     parent: issue.fields.parent?.key ? workItemMap.get(issue.fields.parent.key) : undefined,
     start_date: formatDate(issue.fields.customfield_10015) ?? undefined,
     target_date: formatDate(issue.fields.duedate) ?? undefined,
   };
+}
+
+function originalUser(role: string, user: JiraUser): string {
+  const name = user.displayName || user.accountId;
+  const identity = user.emailAddress ? `${name} (${user.emailAddress})` : name;
+  return `<p><strong>Original Jira ${role}:</strong> ${escapeHtml(identity)}</p>`;
 }
 
 // ─── Comment Migration ───────────────────────────────────────────────────────
@@ -518,8 +559,8 @@ async function migrateSingleComment(
   comment: JiraComment,
   issueKey: string,
 ): Promise<void> {
-  const author = comment.author?.displayName ?? 'Unknown';
-  const date = comment.created ?? 'unknown date';
+  const author = escapeHtml(comment.author?.displayName ?? 'Unknown');
+  const date = escapeHtml(comment.created ?? 'unknown date');
   const body = comment.renderedBody ?? '<p>(empty comment)</p>';
 
   const commentHtml = `<p><strong>Originally by ${author} on ${date}:</strong></p>${body}`;

@@ -71,6 +71,18 @@ export function formatDate(dateStr: string | null | undefined): string | null {
 
 // ─── String Helpers ──────────────────────────────────────────────────────────
 
+/** Escape plain text before inserting it into HTML. */
+export function escapeHtml(value: string): string {
+  const entities: Record<string, string> = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  };
+  return value.replace(/[&<>"']/g, (character) => entities[character]);
+}
+
 /**
  * Truncate `str` to `maxLen` characters, appending `…` when truncated.
  */

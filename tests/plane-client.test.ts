@@ -144,6 +144,15 @@ describe('PlaneClient', () => {
   // ── listMembers ──────────────────────────────────────────────────────
 
   describe('listMembers', () => {
+    it('requests the selected project roster when mapping project assignees', async () => {
+      const members = [{ id: 'm1', email: 'alice@example.com' }];
+      mockFetch.mockResolvedValueOnce(response(members));
+      expect(await client.listMembers('proj-1')).toEqual(members);
+      expect(String(mockFetch.mock.calls[0][0])).toBe(
+        'https://plane.test.com/api/v1/workspaces/test-ws/projects/proj-1/project-members/',
+      );
+    });
+
     it('returns workspace members', async () => {
       const members = [{ id: 'm1', email: 'alice@example.com', display_name: 'Alice', role: 20 }];
       mockFetch.mockResolvedValueOnce(response(members));

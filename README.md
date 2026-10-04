@@ -12,8 +12,9 @@ Written in **TypeScript** with full type safety, built for reliability at scale.
 - **Full issue migration** — title, HTML description, priority, status, labels, assignees, dates
 - **Comment migration** — preserves author attribution and timestamps
 - **Attachment migration** — downloads from Jira and uploads to Plane (3-step presigned upload)
-- **Status → State mapping** — interactively map Jira statuses to Plane states (auto-matches by name)
-- **User mapping** — map Jira assignees to Plane members (auto-matches by email)
+- **Status → State mapping** — use a reusable JSON file or map interactively (auto-matches by name)
+- **User mapping** — use a reusable JSON file or map interactively (auto-matches by email)
+- **Original attribution** — preserves Jira reporters and unmapped assignees in descriptions
 - **Issue type labels** — creates "Jira: Bug", "Jira: Story", etc. labels in Plane
 - **Priority mapping** — Highest→urgent, High→high, Medium→medium, Low/Lowest→low
 - **Parent-child relationships** — preserves sub-task hierarchy
@@ -123,15 +124,46 @@ The tool will:
 ### Non-interactive mode
 
 ```bash
-# Specify projects directly
-npm start -- --project-key MYPROJ --plane-project <plane-project-uuid>
+# Supply projects and both mapping files to run without prompts
+npm start -- --project-key MYPROJ --plane-project <plane-project-uuid> \
+  --users-file data/users.json --state-mapping-file data/states.json
 
 # Preview without making changes
 npm start -- --dry-run
 
-# Combine flags
-npm start -- --project-key MYPROJ --plane-project <uuid> --dry-run
+# Preview the same file-based migration
+npm start -- --project-key MYPROJ --plane-project <uuid> \
+  --users-file data/users.json --state-mapping-file data/states.json --dry-run
 ```
+
+### Mapping files
+
+Store local mapping files in `data/`, which is ignored by Git because user files contain personal information.
+
+`data/users.json` maps Jira account IDs to member emails in the selected Plane project:
+
+```json
+{
+  "jira-account-id": { "email": "alice@example.com" },
+  "former-user-account-id": { "email": null }
+}
+```
+
+Emails match without regard to case. Destination users must be active, assignable members of the selected project. Missing entries, `null` emails, and emails with no project member leave the user unmapped and produce a count warning. Unmapped assignees retain their original Jira name and email (when Jira provides it) in the description. The importer clears any project default assignee applied during creation. Reporters are always preserved there; Plane's native creator remains the API user. Optional `display_name` and other metadata from existing user files are accepted; only `email` selects the Plane member.
+
+`data/states.json` maps exact Jira status names to Plane state names or IDs:
+
+```json
+{
+  "mapping": {
+    "To Do": "Backlog",
+    "In Progress": "state-uuid",
+    "Done": "Completed"
+  }
+}
+```
+
+Plane state names match without regard to case; use an ID for duplicate names. Every status encountered must have a valid target in the selected project. Missing, `null`, unknown, or ambiguous targets fail before writes. Malformed files also fail before migration. You can supply just one file and select the remaining mappings interactively.
 
 ### CLI flags
 
@@ -141,6 +173,8 @@ npm start -- --project-key MYPROJ --plane-project <uuid> --dry-run
 | `--reimport` | Update all previously migrated issues (skips the interactive prompt) |
 | `--project-key KEY` | Skip Jira project selection, use this project key |
 | `--plane-project ID` | Skip Plane project selection, use this project UUID |
+| `--users-file PATH` | Load Jira account ID to Plane member email mappings from JSON |
+| `--state-mapping-file PATH` | Load Jira status to Plane state name or ID mappings from JSON |
 
 ## What gets migrated
 
@@ -148,9 +182,10 @@ npm start -- --project-key MYPROJ --plane-project <uuid> --dry-run
 |------|-------|-------|
 | Summary | Work item name | |
 | Description (HTML) | `description_html` | Rendered HTML from Jira |
-| Status | State | Mapped interactively |
+| Status | State | Mapped by file or interactively |
 | Priority | Priority | Highest→urgent, High→high, Medium→medium, Low/Lowest→low |
-| Assignee | Assignees | Mapped interactively (auto-matched by email) |
+| Assignee | Assignees | Mapped by file or interactively; original attribution retained when unmapped |
+| Reporter | Description | Original Jira name and email when available |
 | Issue type | Label | Created as "Jira: Bug", "Jira: Story", etc. |
 | Due date | Target date | |
 | Start date | Start date | From `customfield_10015` if available |
@@ -201,7 +236,7 @@ The tool tracks which issues have been migrated using `external_id` (Jira issue 
 - **Import new only** — skip previously migrated issues, only create new ones
 - **Update all** — update existing migrated issues with the latest Jira data and import any new ones (comments and attachments are also de-duplicated)
 
-You can also pass `--reimport` to skip the prompt and update all.
+With both mapping files, reruns skip existing issues without prompting. Pass `--reimport` to update all, including their mapping and attribution. Updates clear the Plane assignee when the Jira assignee is unmapped or absent.
 
 This makes it safe to re-run after failures — already-migrated issues won't be duplicated, and you can update them if the source data changed.
 

@@ -136,11 +136,13 @@ export class PlaneClient {
 
   // ── Members ──────────────────────────────────────────────────────────────
 
-  /** List all workspace members. */
-  async listMembers(): Promise<PlaneMember[]> {
+  /** List project members, or workspace members when no project is supplied. */
+  async listMembers(projectId?: string): Promise<PlaneMember[]> {
     return this.apiCall(async () => {
       const data = await this.request<PlaneApiResponse<PlaneMember>>(
-        `/workspaces/${this.workspaceSlug}/members/`,
+        projectId
+          ? `/workspaces/${this.workspaceSlug}/projects/${projectId}/project-members/`
+          : `/workspaces/${this.workspaceSlug}/members/`,
       );
       return Array.isArray(data) ? data : (data.results ?? []);
     }, 'listing Plane members');

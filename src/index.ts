@@ -16,6 +16,7 @@ import { JiraClient } from './clients/jira.js';
 import { PlaneClient } from './clients/plane.js';
 import { RateLimiter } from './utils/rate-limiter.js';
 import { runMigration } from './services/migrator.js';
+import { loadUsersFile, loadStateMappingFile } from './utils/mapping-files.js';
 import type { RequiredEnvVar, MigrationConfig } from './types/config.js';
 
 // ─── Banner ──────────────────────────────────────────────────────────────────
@@ -49,12 +50,30 @@ async function main(): Promise<void> {
   const flags = parseArgs();
   const dryRun = flags['dry-run'] === true || flags['dry-run'] === 'true';
   const reimport = flags['reimport'] === true || flags['reimport'] === 'true';
+  const usersFile = await loadUsersFile(flags['users-file']);
+  const stateMappingFile = await loadStateMappingFile(flags['state-mapping-file']);
+
+  for (const key of ['project-key', 'plane-project'] as const) {
+    const value = flags[key];
+    if (value !== undefined && (typeof value !== 'string' || !value.trim())) {
+      throw new Error(`--${key} requires a value`);
+    }
+  }
+
+  if (
+    !process.stdin.isTTY &&
+    (!flags['project-key'] || !flags['plane-project'] || !usersFile || !stateMappingFile)
+  ) {
+    throw new Error(
+      'Non-interactive runs require --project-key, --plane-project, --users-file, and --state-mapping-file',
+    );
+  }
 
   if (dryRun) {
     log.warn('Dry run mode — no changes will be made');
   }
   if (reimport) {
-    log.warn('Reimport mode — existing migrated items will be deleted and recreated');
+    log.warn('Reimport mode — existing migrated items will be updated');
   }
 
   // Validate required environment variables
@@ -116,10 +135,10 @@ async function main(): Promise<void> {
   });
 
   // ── Select Jira project ──────────────────────────────────────────────
-  const projectKey = flags['project-key'] ?? await selectJiraProject(jira);
+  const projectKey = flags['project-key'] ?? (await selectJiraProject(jira));
 
   // ── Select Plane project ─────────────────────────────────────────────
-  const planeProjectId = flags['plane-project'] ?? await selectPlaneProject(plane);
+  const planeProjectId = flags['plane-project'] ?? (await selectPlaneProject(plane));
 
   // ── Run migration ────────────────────────────────────────────────────
   await runMigration({
@@ -130,6 +149,8 @@ async function main(): Promise<void> {
     dryRun,
     reimport,
     config: migrationConfig,
+    usersFile,
+    stateMappingFile,
   });
 }
 

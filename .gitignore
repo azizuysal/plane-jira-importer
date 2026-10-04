@@ -8,6 +8,7 @@ credentials.*
 *.log
 .DS_Store
 coverage/
+data/
 .idea/
 .vscode/
 .github/instructions

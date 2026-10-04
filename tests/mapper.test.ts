@@ -1,11 +1,97 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import inquirer from 'inquirer';
 import {
   mapPriority,
+  buildStatusMap,
+  buildUserMap,
   extractStatuses,
   extractUsers,
   extractIssueTypes,
 } from '../src/services/mapper.js';
 import type { JiraIssue } from '../src/types/jira.js';
+import { log } from '../src/utils/logger.js';
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('file mappings', () => {
+  const states = [
+    { id: 's1', name: 'Todo', group: 'unstarted' },
+    { id: 's2', name: 'Done', group: 'completed' },
+  ];
+
+  it('resolves state names without regard to case and exact state IDs without prompting', async () => {
+    const prompt = vi.spyOn(inquirer, 'prompt');
+    expect(
+      await buildStatusMap(['Open', 'Closed'], states, {
+        mapping: { Open: 'TODO', Closed: 's2' },
+      }),
+    ).toEqual({ Open: 's1', Closed: 's2' });
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it.each([{}, { Open: null }, { Open: 'missing' }])(
+    'rejects unresolved states: %j',
+    async (mapping) => {
+      await expect(buildStatusMap(['Open'], states, { mapping })).rejects.toThrow(
+        /Missing|unknown/,
+      );
+    },
+  );
+
+  it('requires an ID when state names are ambiguous', async () => {
+    const duplicates = [...states, { id: 's3', name: 'TODO', group: 'backlog' }];
+    await expect(
+      buildStatusMap(['Open'], duplicates, { mapping: { Open: 'Todo' } }),
+    ).rejects.toThrow('ambiguous; use a state ID');
+    expect(await buildStatusMap(['Open'], duplicates, { mapping: { Open: 's3' } })).toEqual({
+      Open: 's3',
+    });
+  });
+
+  it('matches hidden Jira emails through the file and leaves missing users unmapped', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const prompt = vi.spyOn(inquirer, 'prompt');
+    const users = ['alice', 'former', 'missing', 'unknown'].map((accountId) => ({
+      accountId,
+      displayName: accountId,
+    }));
+    expect(
+      await buildUserMap(users, [{ id: 'm1', email: 'Alice@Example.com' }], {
+        alice: { email: ' alice@example.com ' },
+        former: { email: null },
+        unknown: { email: 'absent@example.com' },
+      }),
+    ).toEqual({ alice: 'm1' });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('3 Jira users'));
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it('rejects ambiguous member emails', async () => {
+    await expect(
+      buildUserMap(
+        [{ accountId: 'a', displayName: 'Alice' }],
+        [
+          { id: 'm1', email: 'alice@example.com' },
+          { id: 'm2', email: 'ALICE@example.com' },
+        ],
+        { a: { email: 'alice@example.com' } },
+      ),
+    ).rejects.toThrow('multiple Plane members');
+  });
+
+  it('retains interactive status and user selection without files', async () => {
+    vi.spyOn(log, 'dim').mockImplementation(() => {});
+    const prompt = vi
+      .spyOn(inquirer, 'prompt')
+      .mockResolvedValueOnce({ stateId: 's2' })
+      .mockResolvedValueOnce({ selectedMemberId: 'm1' });
+    expect(await buildStatusMap(['Open'], states)).toEqual({ Open: 's2' });
+    expect(await buildUserMap([{ accountId: 'a', displayName: 'Alice' }], [{ id: 'm1' }])).toEqual({
+      a: 'm1',
+    });
+    expect(prompt).toHaveBeenCalledTimes(2);
+  });
+});
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 

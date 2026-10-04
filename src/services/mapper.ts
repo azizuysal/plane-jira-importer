@@ -9,6 +9,7 @@ import inquirer from 'inquirer';
 import type { PlaneClient } from '../clients/plane.js';
 import type { JiraIssue, JiraUser } from '../types/jira.js';
 import type { PlanePriority, PlaneState, PlaneMember } from '../types/plane.js';
+import type { StateMappingFile, UsersFile } from '../types/config.js';
 import { log } from '../utils/logger.js';
 
 // ─── Priority Mapping ────────────────────────────────────────────────────────
@@ -42,19 +43,35 @@ export function mapPriority(jiraPriority: string | null): PlanePriority {
 /**
  * Build a mapping from Jira status names to Plane state IDs.
  *
- * Auto-matches by name (case-insensitive). Falls back to an interactive
- * inquirer prompt for unmatched statuses.
+ * Resolves file targets against the selected project, or prompts with
+ * case-insensitive name suggestions when no file is supplied.
  */
 export async function buildStatusMap(
   jiraStatuses: string[],
   planeStates: PlaneState[],
+  file?: StateMappingFile,
 ): Promise<Record<string, string>> {
-  const map: Record<string, string> = {};
+  const map = Object.create(null) as Record<string, string>;
 
   for (const status of jiraStatuses) {
-    const autoMatch = planeStates.find(
-      (s) => s.name.toLowerCase() === status.toLowerCase(),
-    );
+    if (file) {
+      const target = Object.hasOwn(file.mapping, status) ? file.mapping[status] : null;
+      if (!target) {
+        throw new Error(`Missing Plane state mapping for Jira status "${status}"`);
+      }
+      const byId = planeStates.find((state) => state.id === target);
+      const matches = byId
+        ? [byId]
+        : planeStates.filter((state) => state.name.toLowerCase() === target.toLowerCase());
+      if (matches.length !== 1) {
+        throw new Error(
+          `Plane state mapping for "${status}" is ${matches.length ? 'ambiguous; use a state ID' : 'unknown in this project'}`,
+        );
+      }
+      map[status] = matches[0].id;
+      continue;
+    }
+    const autoMatch = planeStates.find((s) => s.name.toLowerCase() === status.toLowerCase());
 
     const choices = planeStates.map((s) => ({
       name: `${s.name} (${s.group})`,
@@ -85,21 +102,40 @@ export async function buildStatusMap(
 /**
  * Build a mapping from Jira account IDs to Plane member IDs.
  *
- * Auto-matches by email (case-insensitive). Falls back to an interactive
- * inquirer prompt for unmatched users.
+ * Resolves file emails against project members, or prompts with
+ * case-insensitive email suggestions when no file is supplied.
  */
 export async function buildUserMap(
   jiraUsers: JiraUser[],
   planeMembers: PlaneMember[],
+  file?: UsersFile,
 ): Promise<Record<string, string>> {
-  const map: Record<string, string> = {};
+  const map = Object.create(null) as Record<string, string>;
+  let unmapped = 0;
 
   for (const user of jiraUsers) {
+    if (file) {
+      const email = Object.hasOwn(file, user.accountId) ? file[user.accountId].email : null;
+      const matches = email
+        ? planeMembers.filter(
+            (member) => member.email?.trim().toLowerCase() === email.trim().toLowerCase(),
+          )
+        : [];
+      if (matches.length > 1) {
+        throw new Error(
+          'A user mapping matches multiple Plane members; resolve duplicate member emails',
+        );
+      }
+      if (matches.length === 1) {
+        map[user.accountId] = matches[0].id;
+      } else {
+        unmapped++;
+      }
+      continue;
+    }
     const autoMatch = planeMembers.find(
       (m) =>
-        m.email &&
-        user.emailAddress &&
-        m.email.toLowerCase() === user.emailAddress.toLowerCase(),
+        m.email && user.emailAddress && m.email.toLowerCase() === user.emailAddress.toLowerCase(),
     );
 
     const choices = [
@@ -131,6 +167,11 @@ export async function buildUserMap(
     }
   }
 
+  if (file && unmapped > 0) {
+    log.warn(
+      `${unmapped} Jira users have no Plane member mapping; original assignees and reporters will be preserved in descriptions`,
+    );
+  }
   return map;
 }
 

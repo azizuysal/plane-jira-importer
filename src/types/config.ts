@@ -56,14 +56,27 @@ export interface MigrationConfig {
   maxAttachmentSizeMb: number;
 }
 
+export interface UserFileEntry {
+  email: string | null;
+  display_name?: string;
+}
+
+export type UsersFile = Record<string, UserFileEntry>;
+
+export interface StateMappingFile {
+  mapping: Record<string, string | null>;
+}
+
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 /** Parsed CLI flags from `process.argv`. */
 export interface CliFlags {
   'dry-run'?: string | boolean;
-  'reimport'?: string | boolean;
+  reimport?: string | boolean;
   'project-key'?: string;
   'plane-project'?: string;
+  'users-file'?: string | boolean;
+  'state-mapping-file'?: string | boolean;
   [key: string]: string | boolean | undefined;
 }
 
